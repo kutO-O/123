@@ -1,64 +1,100 @@
-export type STDPParams = {
-  w?: number;
-  wMin?: number;
-  wMax?: number;
-  aPlus?: number;
-  aMinus?: number;
-  tauPlusMs?: number;
-  tauMinusMs?: number;
-};
+import { LIFNeuron } from './neurons';
 
+/**
+ * Spike-Timing Dependent Plasticity (STDP) Synapse
+ *
+ * Weight update rules:
+ *   Pre before Post (LTP): ΔW = A_plus  * x_pre  * exp(-Δt / tau_plus)
+ *   Post before Pre (LTD): ΔW = -A_minus * x_post * exp(-Δt / tau_minus)
+ *
+ * Online approximation (trace-based):
+ *   When pre fires:  ΔW += -A_minus * x_post  (LTD)
+ *   When post fires: ΔW += +A_plus  * x_pre   (LTP)
+ */
 export class STDPSynapse {
-  public w: number;
-  private params: Required<STDPParams>;
-  private tPreLast: number;
-  private tPostLast: number;
+  readonly pre: LIFNeuron;
+  readonly post: LIFNeuron;
 
-  constructor(params: STDPParams = {}) {
-    this.params = {
-      w: params.w ?? 0.5,
-      wMin: params.wMin ?? 0,
-      wMax: params.wMax ?? 2,
-      aPlus: params.aPlus ?? 0.02,
-      aMinus: params.aMinus ?? 0.025,
-      tauPlusMs: params.tauPlusMs ?? 20,
-      tauMinusMs: params.tauMinusMs ?? 20,
-    };
-    this.w = this.params.w;
-    this.tPreLast = -Infinity;
-    this.tPostLast = -Infinity;
+  // Synaptic weight
+  weight: number;
+  readonly wMin: number;
+  readonly wMax: number;
+
+  // STDP parameters
+  readonly aPlusInit: number;   // LTP amplitude
+  readonly aMinusInit: number;  // LTD amplitude
+  readonly tauPlus: number;     // LTP time constant (ms)
+  readonly tauMinus: number;    // LTD time constant (ms)
+
+  // Conductance / PSP amplitude
+  readonly pspAmplitude: number; // mV bump per spike
+
+  // History
+  weightHistory: number[];
+
+  constructor(
+    pre: LIFNeuron,
+    post: LIFNeuron,
+    options: {
+      weight?: number;
+      wMin?: number;
+      wMax?: number;
+      aPlus?: number;
+      aMinus?: number;
+      tauPlus?: number;
+      tauMinus?: number;
+      pspAmplitude?: number;
+    } = {}
+  ) {
+    this.pre = pre;
+    this.post = post;
+
+    this.weight = options.weight ?? 0.5;
+    this.wMin = options.wMin ?? 0.0;
+    this.wMax = options.wMax ?? 1.0;
+
+    this.aPlusInit = options.aPlus ?? 0.01;
+    this.aMinusInit = options.aMinus ?? 0.0105; // Slightly asymmetric → competitive
+    this.tauPlus = options.tauPlus ?? 20;
+    this.tauMinus = options.tauMinus ?? 20;
+    this.pspAmplitude = options.pspAmplitude ?? 15; // mV
+
+    this.weightHistory = [this.weight];
   }
 
-  reset() {
-    this.tPreLast = -Infinity;
-    this.tPostLast = -Infinity;
-  }
+  /**
+   * Called once per simulation step.
+   * @param preSpike  did the pre-synaptic neuron spike this step?
+   * @param postSpike did the post-synaptic neuron spike this step?
+   * @param learning  whether to apply STDP updates
+   */
+  step(preSpike: boolean, postSpike: boolean, learning: boolean): void {
+    // Transmit PSP to post-synaptic neuron on pre-spike
+    if (preSpike) {
+      this.post.injectCurrent(this.weight * this.pspAmplitude);
 
-  private clamp() {
-    this.w = Math.max(this.params.wMin, Math.min(this.params.wMax, this.w));
-  }
-
-  /** Call when a presynaptic spike occurs */
-  onPreSpike(tMs: number) {
-    // If post fired recently BEFORE this pre => LTD (pre after post)
-    const dt = tMs - this.tPostLast;
-    if (Number.isFinite(dt) && dt >= 0 && dt < 10_000) {
-      const dw = -this.params.aMinus * Math.exp(-dt / this.params.tauMinusMs);
-      this.w += dw;
-      this.clamp();
+      // LTD: pre fires AFTER post → depress
+      if (learning) {
+        const dw = -this.aMinusInit * this.post.traceNeg;
+        this.weight = Math.max(this.wMin, Math.min(this.wMax, this.weight + dw));
+      }
     }
-    this.tPreLast = tMs;
+
+    // LTP: post fires AFTER pre → potentiate
+    if (postSpike && learning) {
+      const dw = this.aPlusInit * this.pre.tracePos;
+      this.weight = Math.max(this.wMin, Math.min(this.wMax, this.weight + dw));
+    }
+
+    this.weightHistory.push(this.weight);
   }
 
-  /** Call when a postsynaptic spike occurs */
-  onPostSpike(tMs: number) {
-    // If pre fired recently BEFORE this post => LTP
-    const dt = tMs - this.tPreLast;
-    if (Number.isFinite(dt) && dt >= 0 && dt < 10_000) {
-      const dw = this.params.aPlus * Math.exp(-dt / this.params.tauPlusMs);
-      this.w += dw;
-      this.clamp();
-    }
-    this.tPostLast = tMs;
+  reset(): void {
+    this.weightHistory = [this.weight];
+  }
+
+  resetFull(initialWeight = 0.5): void {
+    this.weight = initialWeight;
+    this.weightHistory = [this.weight];
   }
 }
